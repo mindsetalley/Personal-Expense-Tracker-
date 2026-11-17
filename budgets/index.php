@@ -1,6 +1,6 @@
 <?php
 session_start();
-require '../config/db.php';
+require __DIR__ . '/../config/db.php';
 require __DIR__ . '/../includes/csrf.php';
 
 if (!isset($_SESSION['user_id'])) {
@@ -8,12 +8,41 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 $user_id = $_SESSION['user_id'];
-$month   = date('Y-m');   // e.g. 2026-11
 $errors  = [];
 
-// Save or update a budget
+// A month is valid only if it looks like 2026-11
+function valid_month(?string $m): bool {
+    return $m !== null && preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $m) === 1;
+}
+function shift_month(string $m, string $by): string {
+    return (new DateTime($m . '-01'))->modify($by)->format('Y-m');
+}
+
+// Which month are we looking at? (GET when viewing, POST when saving)
+$requested = $_POST['month'] ?? $_GET['month'] ?? null;
+$month = valid_month($requested) ? $requested : date('Y-m');
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     csrf_check();
+    $action = $_POST['action'] ?? 'save';
+
+    if ($action === 'copy') {
+        // Copy last month's limits, skipping categories that already have one
+        $prev = shift_month($month, '-1 month');
+        $stmt = $pdo->prepare(
+            "INSERT INTO budgets (user_id, category_id, month_year, limit_amount)
+             SELECT b.user_id, b.category_id, ?, b.limit_amount
+             FROM budgets b
+             JOIN categories c ON c.id = b.category_id AND c.user_id = b.user_id
+             WHERE b.user_id = ? AND b.month_year = ?
+             ON DUPLICATE KEY UPDATE limit_amount = budgets.limit_amount"
+        );
+        $stmt->execute([$month, $user_id, $prev]);
+        header('Location: index.php?month=' . $month . '&copied=' . $stmt->rowCount());
+        exit;
+    }
+
+    // Save or update one budget
     $category_id = $_POST['category_id'] ?? '';
     $limit       = $_POST['limit_amount'] ?? '';
 
@@ -21,7 +50,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = 'Limit must be a number greater than 0.';
     }
 
-    // Category must belong to this user
     $stmt = $pdo->prepare("SELECT id FROM categories WHERE id = ? AND user_id = ?");
     $stmt->execute([$category_id, $user_id]);
     if (!$stmt->fetch()) {
@@ -35,12 +63,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
              ON DUPLICATE KEY UPDATE limit_amount = VALUES(limit_amount)"
         );
         $stmt->execute([$user_id, $category_id, $month, $limit]);
-        header('Location: index.php?saved=1');
+        header('Location: index.php?month=' . $month . '&saved=1');
         exit;
     }
 }
 
-// Each category with its limit (if any) and spending this month
+// Each category with its limit (if any) and spending for the chosen month
 $stmt = $pdo->prepare(
     "SELECT c.id, c.name, b.limit_amount, COALESCE(SUM(t.amount), 0) AS spent
      FROM categories c
@@ -55,6 +83,10 @@ $stmt = $pdo->prepare(
 );
 $stmt->execute([$month, $month, $user_id]);
 $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$prevMonth  = shift_month($month, '-1 month');
+$nextMonth  = shift_month($month, '+1 month');
+$monthLabel = (new DateTime($month . '-01'))->format('F Y');
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -66,23 +98,44 @@ $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 </head>
 <body class="bg-light">
 <?php include __DIR__ . '/../includes/navbar.php'; ?>
-<div class="container mt-4" style="max-width: 720px;">
-    <div class="d-flex justify-content-between align-items-center mb-3">
-        <h3 class="mb-0">Budgets <small class="text-muted fs-6"><?= date('F Y') ?></small></h3>
-        <a href="../dashboard.php" class="btn btn-outline-secondary btn-sm">Dashboard</a>
+<div class="container" style="max-width: 720px;">
+
+    <h3 class="mb-3">Budgets</h3>
+
+    <!-- Month picker -->
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+        <a href="?month=<?= $prevMonth ?>" class="btn btn-outline-secondary btn-sm">&laquo; Previous</a>
+        <strong class="px-2"><?= htmlspecialchars($monthLabel) ?></strong>
+        <a href="?month=<?= $nextMonth ?>" class="btn btn-outline-secondary btn-sm">Next &raquo;</a>
+
+        <form method="GET" class="d-flex gap-2 ms-auto">
+            <input type="month" name="month" value="<?= htmlspecialchars($month) ?>"
+                   class="form-control form-control-sm" required>
+            <button class="btn btn-outline-primary btn-sm">Go</button>
+        </form>
     </div>
 
     <?php if (isset($_GET['saved'])): ?>
         <div class="alert alert-success py-2">Budget saved.</div>
     <?php endif; ?>
+    <?php if (isset($_GET['copied'])): ?>
+        <?php $n = (int) $_GET['copied']; ?>
+        <div class="alert alert-<?= $n > 0 ? 'success' : 'info' ?> py-2">
+            <?= $n > 0
+                ? "Copied $n budget" . ($n === 1 ? '' : 's') . " from " . htmlspecialchars((new DateTime($prevMonth . '-01'))->format('F Y')) . "."
+                : 'Nothing to copy. Last month has no budgets, or this month already has them all.' ?>
+        </div>
+    <?php endif; ?>
     <?php foreach ($errors as $error): ?>
         <div class="alert alert-danger py-2"><?= htmlspecialchars($error) ?></div>
     <?php endforeach; ?>
 
-    <div class="card shadow-sm mb-4">
+    <div class="card shadow-sm mb-3">
         <div class="card-body">
             <form method="POST" class="row g-2 align-items-end">
-            <?= csrf_field() ?>
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="save">
+                <input type="hidden" name="month" value="<?= htmlspecialchars($month) ?>">
                 <div class="col-sm-5">
                     <label class="form-label">Category</label>
                     <select name="category_id" class="form-select" required>
@@ -101,6 +154,16 @@ $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
             </form>
         </div>
     </div>
+
+    <form method="POST" class="mb-4"
+          onsubmit="return confirm('Copy budgets from <?= htmlspecialchars((new DateTime($prevMonth . '-01'))->format('F Y')) ?>? Existing budgets for this month will not be changed.');">
+        <?= csrf_field() ?>
+        <input type="hidden" name="action" value="copy">
+        <input type="hidden" name="month" value="<?= htmlspecialchars($month) ?>">
+        <button class="btn btn-outline-secondary btn-sm">
+            Copy budgets from <?= htmlspecialchars((new DateTime($prevMonth . '-01'))->format('F Y')) ?>
+        </button>
+    </form>
 
     <?php foreach ($rows as $r):
         $spent = (float) $r['spent'];
